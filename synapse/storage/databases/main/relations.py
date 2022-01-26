@@ -16,6 +16,7 @@ import logging
 from typing import (
     TYPE_CHECKING,
     Any,
+    Collection,
     Dict,
     Iterable,
     List,
@@ -28,7 +29,7 @@ from typing import (
 import attr
 from frozendict import frozendict
 
-from synapse.api.constants import EventTypes, RelationTypes
+from synapse.api.constants import RelationTypes
 from synapse.events import EventBase
 from synapse.storage._base import SQLBaseStore
 from synapse.storage.database import (
@@ -38,12 +39,14 @@ from synapse.storage.database import (
     make_in_list_sql_clause,
 )
 from synapse.storage.databases.main.stream import generate_pagination_where_clause
+from synapse.storage.engines import PostgresEngine
 from synapse.storage.relations import (
     AggregationPaginationToken,
     PaginationChunk,
     RelationPaginationToken,
 )
 from synapse.util.caches.descriptors import cached
+from synapse.util.caches.lrucache import LruCache
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
@@ -62,6 +65,11 @@ class RelationsWorkerStore(SQLBaseStore):
 
         self._msc1849_enabled = hs.config.experimental.msc1849_enabled
         self._msc3440_enabled = hs.config.experimental.msc3440_enabled
+
+        self.applicable_edit_cache: LruCache[str, Optional[EventBase]] = LruCache(
+            cache_name="applicable_edit_cache",
+            max_size=1000,
+        )
 
     @cached(tree=True)
     async def get_relations_for_event(
@@ -325,22 +333,38 @@ class RelationsWorkerStore(SQLBaseStore):
             "get_aggregation_groups_for_event", _get_aggregation_groups_for_event_txn
         )
 
-    @cached()
-    async def get_applicable_edit(
-        self, event_id: str, room_id: str
-    ) -> Optional[EventBase]:
+    async def _get_applicable_edits(
+        self, event_ids: Iterable[str]
+    ) -> Dict[str, EventBase]:
         """Get the most recent edit (if any) that has happened for the given
-        event.
+        events.
 
         Correctly handles checking whether edits were allowed to happen.
 
         Args:
-            event_id: The original event ID
-            room_id: The original event's room ID
+            event_ids: The original event IDs
 
         Returns:
-            The most recent edit, if any.
+            A map of the most recent edit for each event. A missing event implies
+            there is no edits.
         """
+
+        # A map of the original event IDs to the edit events.
+        edits_by_original = {}
+
+        # Check if an edit for this event is currently cached.
+        event_ids_to_check = []
+        for event_id in event_ids:
+            if event_id not in self.applicable_edit_cache:
+                event_ids_to_check.append(event_id)
+            else:
+                edit_event = self.applicable_edit_cache[event_id]
+                if edit_event:
+                    edits_by_original[event_id] = edit_event
+
+        # If all events were cached, all done.
+        if not event_ids_to_check:
+            return edits_by_original
 
         # We only allow edits for `m.room.message` events that have the same sender
         # and event type. We can't assert these things during regular event auth so
@@ -348,37 +372,72 @@ class RelationsWorkerStore(SQLBaseStore):
 
         # Fetches latest edit that has the same type and sender as the
         # original, and is an `m.room.message`.
-        sql = """
-            SELECT edit.event_id FROM events AS edit
-            INNER JOIN event_relations USING (event_id)
-            INNER JOIN events AS original ON
-                original.event_id = relates_to_id
-                AND edit.type = original.type
-                AND edit.sender = original.sender
-            WHERE
-                relates_to_id = ?
-                AND relation_type = ?
-                AND edit.room_id = ?
-                AND edit.type = 'm.room.message'
-            ORDER by edit.origin_server_ts DESC, edit.event_id DESC
-            LIMIT 1
-        """
+        if isinstance(self.database_engine, PostgresEngine):
+            # The `DISTINCT ON` clause will pick the *first* row it encounters,
+            # so ordering by origin server ts + event ID desc will ensure we get
+            # the latest edit.
+            sql = """
+                SELECT DISTINCT ON (original.event_id) original.event_id, edit.origin_server_ts, edit.event_id FROM events AS edit
+                INNER JOIN event_relations USING (event_id)
+                INNER JOIN events AS original ON
+                    original.event_id = relates_to_id
+                    AND edit.type = original.type
+                    AND edit.sender = original.sender
+                    AND edit.room_id = original.room_id
+                WHERE
+                    %s
+                    AND relation_type = ?
+                    AND edit.type = 'm.room.message'
+                ORDER by original.event_id DESC, edit.origin_server_ts DESC, edit.event_id DESC
+            """
+        else:
+            # SQLite has special handling for bare columns when using MIN/MAX
+            # with a `GROUP BY` clause where it picks the value from a row that
+            # matches the MIN/MAX.
+            sql = """
+                SELECT original.event_id, MAX(edit.origin_server_ts), MAX(edit.event_id) FROM events AS edit
+                INNER JOIN event_relations USING (event_id)
+                INNER JOIN events AS original ON
+                    original.event_id = relates_to_id
+                    AND edit.type = original.type
+                    AND edit.sender = original.sender
+                    AND edit.room_id = original.room_id
+                WHERE
+                    %s
+                    AND relation_type = ?
+                    AND edit.type = 'm.room.message'
+                GROUP BY (original.event_id)
+            """
 
-        def _get_applicable_edit_txn(txn: LoggingTransaction) -> Optional[str]:
-            txn.execute(sql, (event_id, RelationTypes.REPLACE, room_id))
-            row = txn.fetchone()
-            if row:
-                return row[0]
-            return None
+        def _get_applicable_edits_txn(txn: LoggingTransaction) -> Dict[str, str]:
+            clause, args = make_in_list_sql_clause(
+                txn.database_engine, "relates_to_id", event_ids_to_check
+            )
+            args.append(RelationTypes.REPLACE)
 
-        edit_id = await self.db_pool.runInteraction(
-            "get_applicable_edit", _get_applicable_edit_txn
+            txn.execute(sql % (clause,), args)
+            rows = txn.fetchall()
+            return {row[0]: row[2] for row in rows}
+
+        edit_ids = await self.db_pool.runInteraction(
+            "get_applicable_edits", _get_applicable_edits_txn
         )
 
-        if not edit_id:
-            return None
+        edits = await self.get_events(edit_ids.values())  # type: ignore[attr-defined]
 
-        return await self.get_event(edit_id, allow_none=True)  # type: ignore[attr-defined]
+        # Add the newly checked events to the cache. If an edit exists, add it to
+        # the results.
+        for original_event_id in event_ids_to_check:
+            # There might not be an edit or the event might not be known. In
+            # either case, cache the None.
+            edit_event_id = edit_ids.get(original_event_id)
+            edit_event = edits.get(edit_event_id)
+
+            self.applicable_edit_cache.set(original_event_id, edit_event)
+            if edit_event:
+                edits_by_original[original_event_id] = edit_event
+
+        return edits_by_original
 
     @cached()
     async def get_thread_summary(
@@ -598,9 +657,6 @@ class RelationsWorkerStore(SQLBaseStore):
             The bundled aggregations for an event, if bundled aggregations are
             enabled and the event can have bundled aggregations.
         """
-        # State events and redacted events do not get bundled aggregations.
-        if event.is_state() or event.internal_metadata.is_redacted():
-            return None
 
         # Do not bundle aggregations for an event which represents an edit or an
         # annotation. It does not make sense for them to have related events.
@@ -628,13 +684,6 @@ class RelationsWorkerStore(SQLBaseStore):
         if references.chunk:
             aggregations[RelationTypes.REFERENCE] = references.to_dict()
 
-        edit = None
-        if event.type == EventTypes.Message:
-            edit = await self.get_applicable_edit(event_id, room_id)
-
-        if edit:
-            aggregations[RelationTypes.REPLACE] = edit
-
         # If this event is the start of a thread, include a summary of the replies.
         if self._msc3440_enabled:
             thread_count, latest_thread_event = await self.get_thread_summary(
@@ -654,9 +703,7 @@ class RelationsWorkerStore(SQLBaseStore):
         return aggregations
 
     async def get_bundled_aggregations(
-        self,
-        events: Iterable[EventBase],
-        user_id: str,
+        self, events: Collection[EventBase], user_id: str
     ) -> Dict[str, Dict[str, Any]]:
         """Generate bundled aggregations for events.
 
@@ -672,12 +719,28 @@ class RelationsWorkerStore(SQLBaseStore):
         if not self._msc1849_enabled:
             return {}
 
-        # TODO Parallelize.
-        results = {}
+        # State events and redacted events do not get bundled aggregations.
+        events = [
+            event
+            for event in events
+            if not event.is_state() and not event.internal_metadata.is_redacted()
+        ]
+
+        # event ID -> bundled aggregation in non-serialized form.
+        results: Dict[str, Dict[str, Any]] = {}
+
+        event_ids = [event.event_id for event in events]
+
+        # Fetch any edits.
+        edits = await self._get_applicable_edits(event_ids)
+        for event_id, edit in edits.items():
+            results.setdefault(event_id, {})[RelationTypes.REPLACE] = edit
+
+        # Fetch other relations per event.
         for event in events:
             event_result = await self._get_bundled_aggregation_for_event(event, user_id)
             if event_result is not None:
-                results[event.event_id] = event_result
+                results.setdefault(event.event_id, {}).update(event_result)
 
         return results
 
